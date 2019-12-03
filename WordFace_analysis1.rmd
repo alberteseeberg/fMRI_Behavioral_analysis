@@ -1,0 +1,196 @@
+---
+title: "WordFace_data_analysis"
+author: "Originally: Mikkel Wallentin; Extended by Group 2"
+date: "10/9/2019"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+```
+
+## NOTES:
+
+* img_N1 is the label of the previous trial image
+
+## Load data from folder
+```{r}
+setwd("/Users/alberteseeberg/Desktop/Semester_1_kandidat/Advanced_Cognitive_Neuroscience/MEG-fMRI_assignment/Behavioral/faceWord_exp_data")
+datadir<-"/Users/alberteseeberg/Desktop/Semester_1_kandidat/Advanced_Cognitive_Neuroscience/MEG-fMRI_assignment/Behavioral/faceWord_exp_data"
+
+#Find files related to session 1b, 2b  and 3b
+files_WordFace<-list.files(datadir,pattern='+?).csv')
+files_WordFace
+
+WordFace <- plyr::ldply(seq_along(files_WordFace), function(iii){
+  #find time point from log-file name
+  xx<-files_WordFace[iii]
+  h<-substr(xx, nchar(xx)-12, nchar(xx)-11)
+  m<-substr(xx, nchar(xx)-9, nchar(xx)-8)
+  time=as.integer(paste(h,m,sep=''))
+  #Load data
+  data1<-read.csv(files_WordFace[iii])
+  data1$time <- time+(data1$onset_img/60)
+  data1$ID <- as.character(data1$ID)
+  data1$correct <- mean(data1$correct_resp)
+  data1$imgN1 <- data1$img[c(60, 1:59)]
+  data1$file_name <- xx
+  data1
+  
+})
+
+WordFace=subset(WordFace,correct_resp==1)
+WordFace=subset(WordFace,rt>0.1)
+WordFace <- dplyr::as_tibble(WordFace)
+WordFace["abs_word_score_pc"] <- abs(WordFace["word_score_pc"])
+WordFace["no_squared"] <- WordFace["no"]^2
+
+
+```
+
+
+
+## Creating folds for cross validation
+
+```{r}
+library(groupdata2)
+library(doParallel)
+doParallel::registerDoParallel(4) # Set how many cores to use in parallel
+set.seed(1)
+WordFace <- WordFace %>% 
+  fold(k=5, cat_col=c("img", "word_label"),
+       id_col = "ID", 
+       num_fold_cols = 100, # up to 100 unique folds 
+       max_iters = 10, # When to stop trying to make new unique folds
+       parallel = TRUE)
+
+fold_column_names <- names(WordFace)[grep(".folds_", names(WordFace))]
+```
+
+
+## model
+
+```{r}
+library(lmerTest)
+
+model_label <- lmer(rt ~ word_label + (1|ID) + (1|word), data=WordFace)
+summary(model_label)
+
+model_pc <- lmer(rt ~ abs(word_score_pc) + (1|ID) + (1|word), data=WordFace)
+summary(model_pc)
+
+model<-lmer(rt~img+imgN1+word_score_pc+abs(word_score_pc)+no+session+delay_frames_before+(1 | ID)+(1 | word), data=WordFace)
+summary(model)
+```
+
+Note: Mikkel left out the session as random intercept due to it being an ordinal factor. We should consider whether this is important.
+
+## Cross-validation
+
+```{r}
+library(cvms)
+# library(doParallel)
+# doParallel::registerDoParallel(4) 
+
+formulas <- paste0(
+  "rt ~ ",
+  c(
+    "word_label",
+    "word_label + no",
+    "abs_word_score_pc",
+    "abs_word_score_pc + no",
+    "abs_word_score_pc + word_score_pc + no",
+    "word_score_pc + no",
+    "img + no ",
+    "imgN1 + no ",
+    "img + imgN1 + no ",
+    "img + imgN1 * no ",
+    "img + imgN1 + no + abs_word_score_pc ",
+    "img + imgN1 + no + abs_word_score_pc + word_score_pc ",
+    "img + imgN1 + no + abs_word_score_pc + word_score_pc + delay_frames_before",
+    "img + imgN1 + no + abs_word_score_pc + word_score_pc + delay_frames_before + session",
+    "img + no + abs_word_score_pc + word_score_pc + delay_frames_before",
+    "no + abs_word_score_pc + word_score_pc + delay_frames_before"
+  ),
+  " + (1|ID) + (1|word)"
+)
+
+cv <- cross_validate(WordFace, 
+                     formulas = formulas,
+                     fold_cols = fold_column_names,
+                     family = "gaussian",
+                     parallel = TRUE,
+                     control = lmerControl(optimizer = "nloptwrap", calc.derivs = FALSE)
+)
+
+results <- select_metrics(cv) %>% 
+  dplyr::arrange(RMSE, MAE, AIC)
+
+results
+
+results_for_reporting <- results %>% 
+  dplyr::mutate_if(.predicate = is_numeric,.funs = list(~format(., digits=4)))
+                
+write.csv2(results_for_reporting, "../cv_results.csv")# , sep="\t",)
+
+```
+
+
+### Full Model
+```{r}
+full_model <- lmer("rt ~ img + imgN1 + no + abs_word_score_pc + word_score_pc + delay_frames_before + session + (1|ID) + (1|word)",
+                   control = lmerControl(optimizer = "nloptwrap", calc.derivs = FALSE),
+                   data = WordFace)
+summary(full_model)
+```
+
+### Best Model
+```{r}
+best_model <- lmer("rt ~ no + abs_word_score_pc + word_score_pc + delay_frames_before + (1|ID) + (1|word)",
+                   control = lmerControl(optimizer = "nloptwrap", calc.derivs = FALSE),
+                   data = WordFace)
+summary(best_model)
+```
+
+
+## Our plots
+
+```{r}
+library(yarrr)
+library(ggplot2)
+
+#plot of reaction time based on word labels
+plot_pirat_fmri = pirateplot(formula = rt ~ word_label, data = WordFace, main = "Results", xlab = "Word Label",ylab="Reaction Time", ylim= c(0,1), theme=2, pal="info", avg.line.o=0.8, bar.f.o = .2, bean.b.o = .7, point.o = 0.3, point.pch = 1, back.col = "white")
+
+#plot of reaction time based on absolute principle component word scores
+word_score_pc_plot = ggplot(aes(x=abs_word_score_pc, y=rt), data=WordFace)+geom_smooth()
+word_score_pc_plot
+
+```
+
+```{r}
+
+#plot of reaction time across trial number
+figure<-ggplot(aes(x=no,y=rt),data=WordFace)+geom_smooth()
+figure
+
+
+```
+
+#### A table showing mean RT over words
+
+```{r, warning=FALSE, message=FALSE, cache=FALSE}
+
+# A table showing the proportion of males drawn left as a function of the independent variables
+WordFaceAgg <-aggregate(WordFace$rt,
+    by=list(WordFace$word,WordFace$word_score_pc,WordFace$word_label),
+                    FUN=median, na.rm=TRUE)
+
+library(reshape)
+names(WordFaceAgg)<-c('word','word_score_pc','word_label','rt')
+
+figure<-ggplot(aes(x=word_score_pc,y=rt),data=WordFaceAgg)+
+  geom_smooth()+
+  geom_text(aes(label=word,col=word_label))
+figure
+```
